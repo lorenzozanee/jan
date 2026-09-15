@@ -6,29 +6,27 @@ import type { TauriCapabilities, TauriServiceOptions } from '@wdio/tauri-service
 import { SevereServiceError } from 'webdriverio'
 import { isolationEnv } from './isolation.js'
 
-// The app resolves its data folder through `dirs::data_dir()`, so isolation is
-// only sound where that call can be redirected by environment:
+// The app resolves its data folder through `core::app::paths::data_dir()`, and
+// isolation is only sound where that call can be redirected by environment:
 //
 //   macOS   $HOME/Library/Application Support        -> HOME
 //   Linux   $XDG_DATA_HOME, else $HOME/.local/share  -> both (see isolationEnv)
-//   Windows FOLDERID_RoamingAppData via the Win32
-//           known-folder API                         -> no env override exists
+//   Windows %APPDATA%, else FOLDERID_RoamingAppData  -> APPDATA
 //
-// Windows therefore cannot be isolated at all, and a run there would use a real
-// Jan profile. Failing loudly beats pretending.
-if (process.platform !== 'darwin' && process.platform !== 'linux') {
-  throw new Error(
-    `e2e isolation is not possible on ${process.platform}; refusing to run. ` +
-      'On Windows `dirs::data_dir()` reads FOLDERID_RoamingAppData through the ' +
-      'known-folder API, which has no environment override.'
-  )
-}
+// The Windows lever exists because Jan reads `%APPDATA%` itself: `dirs` goes
+// straight to the known-folder API, which offers no override of its own. See
+// src-tauri/src/core/app/paths.rs for why, and isolationEnv() for the one thing
+// that is still not isolated on Windows.
 
 const repoRoot = resolve(import.meta.dirname, '..')
 
 // The desktop binary built by `yarn build:e2e:app`. Debug profile: the e2e
 // feature is a test-only opt-in and never goes near a release artifact.
-const appBinary = join(repoRoot, 'src-tauri/target/debug/Jan-Desktop')
+const appBinary = join(
+  repoRoot,
+  'src-tauri/target/debug',
+  process.platform === 'win32' ? 'Jan-Desktop.exe' : 'Jan-Desktop'
+)
 
 // Fail here rather than 2 minutes later inside a driver-connection retry loop,
 // which is what a missing binary otherwise looks like.
@@ -93,6 +91,21 @@ if (ownsTestHome) {
 // it. An app that cannot write scratch is a confusing failure; make it exist.
 mkdirSync(join(testHome, 'tmp'), { recursive: true })
 
+// The AppData pair is not optional on Windows, and getting it wrong does not
+// look like a path problem. SHGetKnownFolderPath resolves the Roaming and Local
+// known folders from REG_EXPAND_SZ values of the form
+// `%USERPROFILE%\AppData\...`, expands them against this process's environment
+// -- so the USERPROFILE override moves them -- and then verifies the result
+// exists, because `dirs` does not pass KF_FLAG_DONT_VERIFY. Miss `AppData\Local`
+// and `dirs::cache_dir()` is None, which tauri-plugin-http's cookie jar turns
+// into a panic at startup: PluginInitialization("http", "unknown path"). The app
+// then dies before the embedded driver binds, and the run fails in onPrepare
+// reporting only `code=101`.
+if (process.platform === 'win32') {
+  mkdirSync(join(testHome, 'AppData', 'Roaming'), { recursive: true })
+  mkdirSync(join(testHome, 'AppData', 'Local'), { recursive: true })
+}
+
 // Resolved exactly as the service resolves it -- getEmbeddedPort(): the
 // TAURI_WEBDRIVER_PORT env var, else a hardcoded 4445.
 const driverPort = Number(process.env.TAURI_WEBDRIVER_PORT) || 4445
@@ -113,9 +126,11 @@ function somethingIsListening(port: number): Promise<boolean> {
 
 const tauriServiceOptions: TauriServiceOptions = {
   // Embedded WebDriver server (tauri-plugin-wdio-webdriver). Required on macOS,
-  // where there is no WKWebView driver to attach from outside; used on Linux too
-  // so both platforms exercise one path and neither needs `tauri-driver`
-  // installed (Linux could otherwise drive WebKitWebDriver via 'official').
+  // where there is no WKWebView driver to attach from outside; used on Linux and
+  // Windows too so all three exercise one path and none needs `tauri-driver`
+  // installed (those two could otherwise drive WebKitWebDriver / msedgedriver via
+  // 'official'). The plugin has a real WebView2 backend, not just a Unix one:
+  // src/platform/windows.rs.
   driverProvider: 'embedded',
   env: isolationEnv(testHome),
 }
@@ -169,8 +184,11 @@ export const config: WebdriverIO.Config = {
         'embedded WebDriver server uses. This run would drive that process ' +
         'instead of the app it launches. Most likely another e2e run is in ' +
         'progress, or a previous one was killed and left Jan-Desktop alive ' +
-        '(`pkill -f Jan-Desktop`). To use a different port instead, set ' +
-        'TAURI_WEBDRIVER_PORT.'
+        `(\`${
+          process.platform === 'win32'
+            ? 'taskkill /IM Jan-Desktop.exe /F'
+            : 'pkill -f Jan-Desktop'
+        }\`). To use a different port instead, set TAURI_WEBDRIVER_PORT.`
     )
   },
 }
